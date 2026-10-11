@@ -110,3 +110,96 @@ dates, close_arr, ma5_arr = dates_all[has_answer], close_all[has_answer], ma5_al
 print("X shape:", X.shape, "-> (samples, days in window, features)")
 print("y shape:", y.shape, "-> one next-day return per sample")
  
+ # %% STEP 7: THE MODEL + TRAINING FUNCTION
+def build_model(window, n_features):
+    """A 2-layer LSTM. An LSTM is a neural network with 'memory' for sequences."""
+    model = keras.Sequential([
+        keras.layers.Input(shape=(window, n_features)),
+        keras.layers.LSTM(64, return_sequences=True),  # return_sequences=True passes the whole
+                                                       # sequence on so a second LSTM can stack on top
+        keras.layers.Dropout(0.2),                     # randomly ignores 20% of units while training;
+                                                       # this fights overfitting (memorizing the past)
+        keras.layers.LSTM(32),                         # second LSTM returns just its final summary
+        keras.layers.Dropout(0.2),
+        keras.layers.Dense(16, activation="relu"),     # a small regular layer to combine the signals
+        keras.layers.Dense(1),                         # final output: ONE number, tomorrow's return
+    ])
+    # Adam = the optimizer that adjusts the weights. Huber loss = like mean squared error,
+    # but less thrown off by rare giant market moves.
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="huber")
+    return model
+ 
+ def scale(X_part, scaler):
+    """Standardize features (mean 0, spread 1) so no feature dominates just because its numbers
+    are bigger (RSI is ~50 while returns are ~0.01). Clip extremes to +/-5 for stability."""
+    n, w, f = X_part.shape
+    return np.clip(scaler.transform(X_part.reshape(-1, f)).reshape(n, w, f), -5, 5)
+ 
+ 
+def fit_model(X_train, y_train):
+    """Train a fresh model. Returns (model, scaler, y_std) so we can predict later."""
+    keras.utils.set_random_seed(42)   # makes results repeatable run to run
+ 
+    # IMPORTANT: the scaler learns its mean/spread from TRAINING data only. If it peeked at the
+    # test period, information from the "future" would leak into training and inflate results.
+    scaler = StandardScaler().fit(X_train.reshape(-1, X_train.shape[2]))
+    y_std = float(np.std(y_train))            # returns are tiny (~0.01), so we rescale them too
+    Xs, ys = scale(X_train, scaler), y_train / y_std
+
+   # Hold out the LAST 10% of training data (in time order!) to monitor progress.
+    n_val = max(int(len(Xs) * 0.1), 1)
+    model = build_model(X_train.shape[1], X_train.shape[2])
+    model.fit(
+        Xs[:-n_val], ys[:-n_val],
+        validation_data=(Xs[-n_val:], ys[-n_val:]),
+        epochs=EPOCHS, batch_size=32, verbose=0,
+        # Early stopping: quit when validation error stops improving for 5 epochs,
+        # and roll back to the best version. Another guard against overfitting.
+        callbacks=[keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)],
+    )
+    return model, scaler, y_std
+ 
+ 
+def predict_returns(model, scaler, y_std, X_part):
+    """Predict next-day log returns (undoing the rescaling of y)."""
+    return model.predict(scale(X_part, scaler), verbose=0).ravel() * y_std
+
+def predict_returns(model, scaler, y_std, X_part):
+    """Predict next-day log returns (undoing the rescaling of y)."""
+    return model.predict(scale(X_part, scaler), verbose=0).ravel() * y_std
+ 
+ 
+# %% STEP 8: WALK-FORWARD VALIDATION (the honest test)
+# The tutorial approach trains once and tests on the last 5%. That's one lucky-or-unlucky sample.
+# Walk-forward repeats it:  train on the past -> predict the next block -> slide forward.
+#
+#   Fold 1: [ train ................ ][test]
+#   Fold 2: [ train ....................][test]
+#   Fold 3: [ train ........................][test]
+#
+# The model never sees the future during training, just like in real life.
+n = len(y)
+assert n >= MIN_TRAIN + N_SPLITS * TEST_SIZE, (
+    f"Only {n} samples. Use an earlier START, or lower N_SPLITS / TEST_SIZE."
+)
+ 
+predicted = np.full(n, np.nan)   # will hold predictions for test blocks only
+for k in range(N_SPLITS):
+    test_end = n - (N_SPLITS - 1 - k) * TEST_SIZE
+    test_start = test_end - TEST_SIZE
+    print(f"Fold {k + 1}/{N_SPLITS}: training on {test_start} samples, testing on {TEST_SIZE}...")
+    model, scaler, y_std = fit_model(X[:test_start], y[:test_start])
+    predicted[test_start:test_end] = predict_returns(model, scaler, y_std, X[test_start:test_end])
+
+# Keep only the rows that were actually predicted (the test blocks).
+m = ~np.isnan(predicted)
+pred_ret, true_ret = predicted[m], y[m]
+t_dates, t_close, t_ma5 = dates[m], close_arr[m], ma5_arr[m]
+print("Done. Out-of-sample predictions:", len(pred_ret))
+ 
+ 
+# %% STEP 9: COMPARE AGAINST BASELINES
+# A model is only impressive if it beats simple rules. We convert returns back to prices:
+# price_tomorrow = price_today * e^(return).
+true_price = t_close * np.exp(true_ret)
+true_dir = np.sign(true_price - t_close)    # +1 went up, -1 went down
