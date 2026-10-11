@@ -47,4 +47,66 @@ features["vol_chg"] = np.log1p(df["Volume"]).diff()
 # (close / average) - 1 = how far above (+) or below (-) the average we are, as a fraction.
 features["sma10_ratio"] = close / close.rolling(10).mean() - 1
 features["sma30_ratio"] = close / close.rolling(30).mean() - 1
+
+# --- Volatility: how bumpy the last 10 days were (standard deviation of daily returns)
+features["volatility_10"] = features["ret_1"].rolling(10).std()
+ 
+# --- RSI (Relative Strength Index): 0-100 scale of recent gains vs losses.
+# Above ~70 is traditionally "overbought", below ~30 "oversold".
+delta = close.diff()
+avg_gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+avg_loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+features["rsi_14"] = 100 - 100 / (1 + avg_gain / avg_loss.replace(0, np.nan))
+ 
+# --- MACD: difference between a fast (12-day) and slow (26-day) exponential moving average.
+# It's a momentum signal. The "signal line" is a smoothed version of it.
+ema12 = close.ewm(span=12, adjust=False).mean()
+ema26 = close.ewm(span=26, adjust=False).mean()
+macd = ema12 - ema26
+features["macd"] = macd / close                                     # divided by price = scale-free
+features["macd_signal"] = macd.ewm(span=9, adjust=False).mean() / close
+
+# --- Bollinger Bands: a band of +/- 2 standard deviations around the 20-day average.
+sma20 = close.rolling(20).mean()
+std20 = close.rolling(20).std()
+features["bb_width"] = (4 * std20) / sma20                          # how wide the band is
+features["bb_pos"] = (close - (sma20 - 2 * std20)) / (4 * std20)    # where price sits (0=bottom, 1=top)
+ 
+print(f"{features.shape[1]} features built:", list(features.columns))
+ 
+ 
+# %% STEP 5: THE TARGET, AND CLEANING
+# What are we predicting? TOMORROW's log return. `.shift(-1)` pulls tomorrow's value up to
+# today's row, so each row reads: "given everything known today, what happens tomorrow?"
+target = np.log(close).diff().shift(-1)
+
+# Baseline helper: the average of the last 5 closing prices (used as a comparison later).
+ma5 = close.rolling(5).mean()
+ 
+# The first ~30 rows have missing values (a 30-day average needs 30 days of history).
+# Keep only rows where every feature exists.
+valid = features.notna().all(axis=1)
+features, target, close, ma5 = features[valid], target[valid], close[valid], ma5[valid]
+
+# %% STEP 6: BUILD "WINDOWS" (what the LSTM actually sees)
+# An LSTM reads SEQUENCES. Each training example is a block of the last 60 days of features
+# (shape: 60 days x 13 features), paired with ONE answer: the return on the following day.
+F = features.values.astype("float32")
+end_rows = np.arange(WINDOW - 1, len(F))   # the last day of each window
+ 
+X_all = np.stack([F[i - WINDOW + 1 : i + 1] for i in end_rows])   # (samples, 60, 13)
+y_all = target.values[end_rows]
+dates_all = features.index[end_rows]
+close_all = close.values[end_rows]
+ma5_all = ma5.values[end_rows]
+ 
+# The newest window has no "tomorrow" yet, so it has no answer (NaN). We can't train or test on
+# it, but we save it: it's the window we'll use to forecast the real next day at the very end.
+X_latest = X_all[-1:]
+has_answer = ~np.isnan(y_all)
+X, y = X_all[has_answer], y_all[has_answer]
+dates, close_arr, ma5_arr = dates_all[has_answer], close_all[has_answer], ma5_all[has_answer]
+ 
+print("X shape:", X.shape, "-> (samples, days in window, features)")
+print("y shape:", y.shape, "-> one next-day return per sample")
  
