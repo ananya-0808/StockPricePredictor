@@ -129,7 +129,7 @@ def build_model(window, n_features):
     model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="huber")
     return model
  
- def scale(X_part, scaler):
+def scale(X_part, scaler):
     """Standardize features (mean 0, spread 1) so no feature dominates just because its numbers
     are bigger (RSI is ~50 while returns are ~0.01). Clip extremes to +/-5 for stability."""
     n, w, f = X_part.shape
@@ -203,3 +203,46 @@ print("Done. Out-of-sample predictions:", len(pred_ret))
 # price_tomorrow = price_today * e^(return).
 true_price = t_close * np.exp(true_ret)
 true_dir = np.sign(true_price - t_close)    # +1 went up, -1 went down
+
+candidates = {
+    "LSTM": t_close * np.exp(pred_ret),
+    "Naive (tomorrow = today)": t_close,    # baseline 1: predict no change
+    "5-day moving average": t_ma5,          # baseline 2: predict the recent average
+}
+ 
+rows = []
+for name, pred_price in candidates.items():
+    err = pred_price - true_price
+    pred_dir = np.sign(pred_price - t_close)
+    rows.append({
+        "Model": name,
+        "RMSE": np.sqrt(np.mean(err ** 2)),               # typical error, punishes big misses
+        "MAE": np.mean(np.abs(err)),                      # typical error in dollars
+        "MAPE %": np.mean(np.abs(err / true_price)) * 100,  # typical error as a percent
+        # Directional accuracy: how often it got up-vs-down right (50% = coin flip).
+        "Directional acc %": np.mean(pred_dir == true_dir) * 100 if np.any(pred_dir != 0) else np.nan,
+    })
+# Baseline 3: always guess "up". Stocks drift upward, so this often scores above 50%!
+rows.append({"Model": "Always predict up", "Directional acc %": np.mean(true_dir > 0) * 100})
+ 
+results = pd.DataFrame(rows).set_index("Model").round(3)
+results   # displays as a table
+
+# %% STEP 10: BACKTEST A SIMPLE STRATEGY
+# Rule: if the model predicts a positive return, hold the stock tomorrow; otherwise sit in cash.
+# We charge a small fee every time the position changes (0.05%), since real trading isn't free.
+COST = 0.0005
+position = (pred_ret > 0).astype(float)                      # 1 = holding, 0 = cash
+trades = np.abs(np.diff(position, prepend=0.0))              # 1 whenever we switch
+strategy_ret = position * true_ret - trades * COST           # daily result of the strategy
+ 
+ 
+def summarize(r):
+    equity = np.exp(np.cumsum(r))                            # growth of $1
+    drawdown = equity / np.maximum.accumulate(equity) - 1    # drop from the previous peak
+    return {
+        "Total return %": round((equity[-1] - 1) * 100, 2),
+        # Sharpe ratio = return per unit of risk, annualized (252 trading days per year).
+        "Sharpe": round(r.mean() / r.std() * np.sqrt(252), 2) if r.std() > 0 else np.nan,
+        "Worst drop %": round(drawdown.min() * 100, 2),      # max drawdown
+    }
